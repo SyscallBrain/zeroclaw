@@ -16,6 +16,8 @@ use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use regex::{Regex, RegexSet};
+use rustyline::error::ReadlineError;
+use rustyline::{Config as RustylineConfig, DefaultEditor};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt::Write;
@@ -523,6 +525,13 @@ struct InteractiveSessionState {
     history: Vec<ChatMessage>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InteractiveEditMode {
+    Default,
+    Vim,
+    Emacs,
+}
+
 impl InteractiveSessionState {
     fn from_history(history: &[ChatMessage]) -> Self {
         Self {
@@ -547,7 +556,6 @@ fn load_interactive_session_history(path: &Path, system_prompt: &str) -> Result<
 
     Ok(state.history)
 }
-
 fn save_interactive_session_history(path: &Path, history: &[ChatMessage]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -555,6 +563,36 @@ fn save_interactive_session_history(path: &Path, history: &[ChatMessage]) -> Res
 
     let payload = serde_json::to_string_pretty(&InteractiveSessionState::from_history(history))?;
     std::fs::write(path, payload)?;
+    Ok(())
+}
+
+fn create_interactive_editor(mode: InteractiveEditMode) -> Result<DefaultEditor> {
+    let mut builder = RustylineConfig::builder();
+    builder = match mode {
+        InteractiveEditMode::Default => builder,
+        InteractiveEditMode::Vim => builder.edit_mode(rustyline::EditMode::Vi),
+        InteractiveEditMode::Emacs => builder.edit_mode(rustyline::EditMode::Emacs),
+    };
+
+    Ok(DefaultEditor::with_config(builder.build())?)
+}
+
+fn swap_interactive_editor_mode(
+    editor: &mut DefaultEditor,
+    mode: InteractiveEditMode,
+) -> Result<()> {
+    let history_entries = editor
+        .history()
+        .iter()
+        .map(std::borrow::ToOwned::to_owned)
+        .collect::<Vec<_>>();
+
+    let mut next_editor = create_interactive_editor(mode)?;
+    for entry in history_entries {
+        let _ = next_editor.add_history_entry(entry.as_str());
+    }
+
+    *editor = next_editor;
     Ok(())
 }
 
@@ -4016,35 +4054,54 @@ pub async fn run(
             vec![ChatMessage::system(&system_prompt)]
         };
 
-        loop {
-            print!("> ");
-            let _ = std::io::stdout().flush();
+        let mut current_edit_mode = InteractiveEditMode::Default;
+        let mut editor = create_interactive_editor(current_edit_mode)?;
 
-            // Read raw bytes to avoid UTF-8 validation errors when PTY
-            // transport splits multi-byte characters at frame boundaries
-            // (e.g. CJK input with spaces over kubectl exec / SSH).
-            let mut raw = Vec::new();
-            match std::io::BufRead::read_until(&mut std::io::stdin().lock(), b'\n', &mut raw) {
-                Ok(0) => break,
-                Ok(_) => {}
+        loop {
+            let input = match editor.readline("> ") {
+                Ok(line) => line,
+                Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
                 Err(e) => {
                     eprintln!("\nError reading input: {e}\n");
                     break;
                 }
-            }
-            let input = String::from_utf8_lossy(&raw).into_owned();
+            };
 
             let user_input = input.trim().to_string();
             if user_input.is_empty() {
                 continue;
             }
+
+            let _ = editor.add_history_entry(user_input.as_str());
+
             match user_input.as_str() {
                 "/quit" | "/exit" => break,
                 "/help" => {
                     println!("Available commands:");
                     println!("  /help        Show this help message");
                     println!("  /clear /new  Clear conversation history");
+                    println!("  /vim         Enable Vim keybindings");
+                    println!("  /emacs       Enable Emacs keybindings");
+                    println!("  /default     Restore default editing mode");
                     println!("  /quit /exit  Exit interactive mode\n");
+                    continue;
+                }
+                "/vim" => {
+                    current_edit_mode = InteractiveEditMode::Vim;
+                    swap_interactive_editor_mode(&mut editor, current_edit_mode)?;
+                    println!("Vim editing mode enabled.\n");
+                    continue;
+                }
+                "/emacs" => {
+                    current_edit_mode = InteractiveEditMode::Emacs;
+                    swap_interactive_editor_mode(&mut editor, current_edit_mode)?;
+                    println!("Emacs editing mode enabled.\n");
+                    continue;
+                }
+                "/default" => {
+                    current_edit_mode = InteractiveEditMode::Default;
+                    swap_interactive_editor_mode(&mut editor, current_edit_mode)?;
+                    println!("Default editing mode enabled.\n");
                     continue;
                 }
                 "/clear" | "/new" => {
@@ -4052,20 +4109,21 @@ pub async fn run(
                         "This will clear the current conversation and delete all session memory."
                     );
                     println!("Core memories (long-term facts/preferences) will be preserved.");
-                    print!("Continue? [y/N] ");
-                    let _ = std::io::stdout().flush();
 
-                    let mut confirm_raw = Vec::new();
-                    if std::io::BufRead::read_until(
-                        &mut std::io::stdin().lock(),
-                        b'\n',
-                        &mut confirm_raw,
-                    )
-                    .is_err()
-                    {
-                        continue;
+                    let confirm = match editor.readline("Continue? [y/N] ") {
+                        Ok(line) => line,
+                        Err(ReadlineError::Interrupted | ReadlineError::Eof) => {
+                            println!("Cancelled.\n");
+                            continue;
+                        }
+                        Err(e) => {
+                            eprintln!("\nError reading input: {e}\n");
+                            continue;
+                        }
+                    };
+                    if !confirm.trim().is_empty() {
+                        let _ = editor.add_history_entry(confirm.as_str());
                     }
-                    let confirm = String::from_utf8_lossy(&confirm_raw);
                     if !matches!(confirm.trim().to_lowercase().as_str(), "y" | "yes") {
                         println!("Cancelled.\n");
                         continue;
