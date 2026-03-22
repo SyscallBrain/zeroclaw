@@ -17,7 +17,8 @@ use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use regex::{Regex, RegexSet};
 use rustyline::error::ReadlineError;
-use rustyline::{Config as RustylineConfig, DefaultEditor};
+use rustyline::history::FileHistory;
+use rustyline::{Config as RustylineConfig, EditMode, Editor};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt::Write;
@@ -518,12 +519,13 @@ async fn auto_compact_history(
 
     Ok(true)
 }
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct InteractiveSessionState {
     version: u32,
     history: Vec<ChatMessage>,
 }
+
+type InteractiveEditor = Editor<(), FileHistory>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InteractiveEditMode {
@@ -556,6 +558,7 @@ fn load_interactive_session_history(path: &Path, system_prompt: &str) -> Result<
 
     Ok(state.history)
 }
+
 fn save_interactive_session_history(path: &Path, history: &[ChatMessage]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -566,19 +569,18 @@ fn save_interactive_session_history(path: &Path, history: &[ChatMessage]) -> Res
     Ok(())
 }
 
-fn create_interactive_editor(mode: InteractiveEditMode) -> Result<DefaultEditor> {
-    let mut builder = RustylineConfig::builder();
-    builder = match mode {
-        InteractiveEditMode::Default => builder,
-        InteractiveEditMode::Vim => builder.edit_mode(rustyline::EditMode::Vi),
-        InteractiveEditMode::Emacs => builder.edit_mode(rustyline::EditMode::Emacs),
+fn create_interactive_editor(mode: InteractiveEditMode) -> Result<InteractiveEditor> {
+    let builder = match mode {
+        InteractiveEditMode::Default => RustylineConfig::builder(),
+        InteractiveEditMode::Vim => RustylineConfig::builder().edit_mode(EditMode::Vi),
+        InteractiveEditMode::Emacs => RustylineConfig::builder().edit_mode(EditMode::Emacs),
     };
 
-    Ok(DefaultEditor::with_config(builder.build())?)
+    Ok(Editor::<(), FileHistory>::with_config(builder.build())?)
 }
 
 fn swap_interactive_editor_mode(
-    editor: &mut DefaultEditor,
+    editor: &mut InteractiveEditor,
     mode: InteractiveEditMode,
 ) -> Result<()> {
     let history_entries = editor
@@ -594,6 +596,18 @@ fn swap_interactive_editor_mode(
 
     *editor = next_editor;
     Ok(())
+}
+
+async fn readline_with_editor(
+    editor: InteractiveEditor,
+    prompt: &'static str,
+) -> Result<(std::result::Result<String, ReadlineError>, InteractiveEditor)> {
+    Ok(tokio::task::spawn_blocking(move || {
+        let mut editor = editor;
+        let result = editor.readline(prompt);
+        (result, editor)
+    })
+    .await?)
 }
 
 /// Build context preamble by searching memory for relevant entries.
@@ -4057,12 +4071,30 @@ pub async fn run(
         let mut current_edit_mode = InteractiveEditMode::Default;
         let mut editor = create_interactive_editor(current_edit_mode)?;
 
+        let history_path = config.config_path.parent().map(|p| p.join(".zeroclaw_history"));
+        if let Some(ref path) = history_path {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = editor.load_history(path);
+        }
+
         loop {
-            let input = match editor.readline("> ") {
+            let (input_result, next_editor) = readline_with_editor(editor, "> ").await?;
+            editor = next_editor;
+
+            let input = match input_result {
                 Ok(line) => line,
-                Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
-                Err(e) => {
-                    eprintln!("\nError reading input: {e}\n");
+                Err(ReadlineError::Interrupted) => {
+                    println!("Interrupted (CTRL-C)");
+                    break;
+                }
+                Err(ReadlineError::Eof) => {
+                    println!("Exit (CTRL-D)");
+                    break;
+                }
+                Err(err) => {
+                    eprintln!("Error reading input: {err}");
                     break;
                 }
             };
@@ -4073,6 +4105,9 @@ pub async fn run(
             }
 
             let _ = editor.add_history_entry(user_input.as_str());
+            if let Some(ref path) = history_path {
+                let _ = editor.save_history(path);
+            }
 
             match user_input.as_str() {
                 "/quit" | "/exit" => break,
@@ -4089,18 +4124,27 @@ pub async fn run(
                 "/vim" => {
                     current_edit_mode = InteractiveEditMode::Vim;
                     swap_interactive_editor_mode(&mut editor, current_edit_mode)?;
+                    if let Some(ref path) = history_path {
+                        let _ = editor.save_history(path);
+                    }
                     println!("Vim editing mode enabled.\n");
                     continue;
                 }
                 "/emacs" => {
                     current_edit_mode = InteractiveEditMode::Emacs;
                     swap_interactive_editor_mode(&mut editor, current_edit_mode)?;
+                    if let Some(ref path) = history_path {
+                        let _ = editor.save_history(path);
+                    }
                     println!("Emacs editing mode enabled.\n");
                     continue;
                 }
                 "/default" => {
                     current_edit_mode = InteractiveEditMode::Default;
                     swap_interactive_editor_mode(&mut editor, current_edit_mode)?;
+                    if let Some(ref path) = history_path {
+                        let _ = editor.save_history(path);
+                    }
                     println!("Default editing mode enabled.\n");
                     continue;
                 }
@@ -4110,7 +4154,11 @@ pub async fn run(
                     );
                     println!("Core memories (long-term facts/preferences) will be preserved.");
 
-                    let confirm = match editor.readline("Continue? [y/N] ") {
+                    let (confirm_result, next_editor) =
+                        readline_with_editor(editor, "Continue? [y/N] ").await?;
+                    editor = next_editor;
+
+                    let confirm = match confirm_result {
                         Ok(line) => line,
                         Err(ReadlineError::Interrupted | ReadlineError::Eof) => {
                             println!("Cancelled.\n");
@@ -4123,6 +4171,9 @@ pub async fn run(
                     };
                     if !confirm.trim().is_empty() {
                         let _ = editor.add_history_entry(confirm.as_str());
+                        if let Some(ref path) = history_path {
+                            let _ = editor.save_history(path);
+                        }
                     }
                     if !matches!(confirm.trim().to_lowercase().as_str(), "y" | "yes") {
                         println!("Cancelled.\n");
