@@ -9886,7 +9886,58 @@ impl RpcDispatcher {
     async fn handle_cron_patch(&self, params: &Value) -> RpcResult {
         let req: CronPatchParams = parse_params(params)?;
         self.selector_agent(Method::CronPatch, &req.agent)?;
+        if req.model.as_deref().is_some_and(|model| model.trim().is_empty()) {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "Cron patch rejected: model is blank; send clear_model to drop the override",
+            ));
+        }
+        if req.allowed_tools.as_ref().is_some_and(Vec::is_empty) {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "Cron patch rejected: allowed_tools is empty; send clear_allowed_tools to drop the allowlist",
+            ));
+        }
+        let session_target = req
+            .session_target
+            .as_deref()
+            .map(crate::cron::SessionTarget::try_parse)
+            .transpose()
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cron patch rejected: {e}")))?;
+        let delivery = req
+            .delivery
+            .clone()
+            .map(serde_json::from_value::<crate::cron::DeliveryConfig>)
+            .transpose()
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cron patch rejected: delivery: {e}")))?;
+        let touches_agent_fields = req.model.is_some()
+            || req.clear_model == Some(true)
+            || session_target.is_some()
+            || req.allowed_tools.is_some()
+            || req.clear_allowed_tools == Some(true);
+        let not_for_shell = || {
+            rpc_err(
+                INVALID_PARAMS,
+                "Cron patch rejected: model, session_target and allowed_tools are not applicable to shell jobs",
+            )
+        };
         let patch = CronJobPatch {
+            enabled: req.enabled,
+            delivery,
+            // The store reads a blank model as "clear the override".
+            model: if req.clear_model == Some(true) {
+                Some(String::new())
+            } else {
+                req.model.clone()
+            },
+            session_target,
+            // The store reads an empty list as "clear the allowlist".
+            allowed_tools: if req.clear_allowed_tools == Some(true) {
+                Some(Vec::new())
+            } else {
+                req.allowed_tools.clone()
+            },
+            uses_memory: req.uses_memory,
             schedule: req.schedule.map(|s| Schedule::Cron {
                 expr: s,
                 tz: if req.clear_tz == Some(true) {
@@ -9908,6 +9959,9 @@ impl RpcDispatcher {
             let config = self.ctx.config.read().clone();
             self.authorize_cron_job(Method::CronPatch, &config, &req.id)?
         };
+        if touches_agent_fields && owner.job_type != crate::cron::JobType::Agent {
+            return Err(not_for_shell());
+        }
         // Held through the update: see `recheck_cron_write_authority`. The
         // config is read again under it, so the command is validated against
         // the policy the write commits under.
@@ -9952,6 +10006,9 @@ impl RpcDispatcher {
                             crate::cron::job_not_found(&req.id)
                         ),
                     ));
+                }
+                if touches_agent_fields && job.job_type != crate::cron::JobType::Agent {
+                    return Err(not_for_shell());
                 }
                 if job.job_type == crate::cron::JobType::Agent && !grants.admin {
                     return Err(rpc_err(
@@ -17044,6 +17101,110 @@ mod tests {
             json!("alpha"),
             "{response}"
         );
+    }
+
+    async fn patch_as_operator(
+        config: &zeroclaw_config::schema::Config,
+        job: &crate::cron::CronJob,
+        patches: Vec<Value>,
+    ) -> Vec<Value> {
+        let ctx = enforcement_ctx(config.clone());
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+        let mut out = Vec::new();
+        for (i, mut patch) in patches.into_iter().enumerate() {
+            patch["id"] = json!(job.id);
+            patch["agent"] = json!(job.agent_alias);
+            out.push(rpc(&mut operator, &mut rx, i as u64 + 1, "cron/patch", patch).await);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn cron_patch_pauses_and_resumes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        let job = seed_cron_job(&config, "alpha", "alpha-job");
+        let r = patch_as_operator(&config, &job, vec![json!({"enabled": false}), json!({"enabled": true})]).await;
+        assert_eq!(r[0]["result"]["enabled"], json!(false), "{}", r[0]);
+        assert_eq!(r[1]["result"]["enabled"], json!(true), "{}", r[1]);
+    }
+
+    #[tokio::test]
+    async fn cron_patch_changes_delivery_session_and_memory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        let job = seed_cron_job(&config, "alpha", "alpha-job");
+        let r = patch_as_operator(
+            &config,
+            &job,
+            vec![json!({
+                "delivery": {"mode": "announce", "channel": "telegram.main", "to": "7"},
+                "session_target": "main", "uses_memory": true
+            })],
+        )
+        .await;
+        let result = &r[0]["result"];
+        assert_eq!(result["delivery"]["mode"], json!("announce"), "{}", r[0]);
+        assert_eq!(result["delivery"]["to"], json!("7"));
+        assert_eq!(result["session_target"], json!("main"));
+        assert_eq!(result["uses_memory"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn cron_patch_sets_and_clears_model_and_tools() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        let job = seed_cron_job(&config, "alpha", "alpha-job");
+        let r = patch_as_operator(
+            &config,
+            &job,
+            vec![
+                json!({"model": "m", "allowed_tools": ["shell"]}),
+                json!({"clear_model": true, "clear_allowed_tools": true}),
+            ],
+        )
+        .await;
+        assert_eq!(r[0]["result"]["model"], json!("m"), "{}", r[0]);
+        assert_eq!(r[0]["result"]["allowed_tools"], json!(["shell"]));
+        assert_eq!(r[1]["result"]["model"], Value::Null, "{}", r[1]);
+        assert_eq!(r[1]["result"]["allowed_tools"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn cron_patch_rejects_blank_model_and_empty_tools() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        let job = seed_cron_job(&config, "alpha", "alpha-job");
+        let r = patch_as_operator(&config, &job, vec![json!({"model": " "}), json!({"allowed_tools": []})]).await;
+        for response in &r {
+            assert_eq!(response["error"]["code"], json!(INVALID_PARAMS), "{response}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cron_patch_rejects_agent_fields_on_a_shell_job() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        let job = seed_shell_cron_job(&config, "alpha", "shell-job");
+        let r = patch_as_operator(
+            &config,
+            &job,
+            vec![
+                json!({"model": "m"}),
+                json!({"session_target": "main"}),
+                json!({"allowed_tools": ["shell"]}),
+                json!({"clear_model": true}),
+            ],
+        )
+        .await;
+        for response in &r {
+            assert_eq!(response["error"]["code"], json!(INVALID_PARAMS), "{response}");
+        }
+        let stored = crate::cron::get_job(&config, &job.id).unwrap();
+        assert_eq!(stored.model, None);
+        // A shell job may still be paused.
+        let r = patch_as_operator(&config, &job, vec![json!({"enabled": false})]).await;
+        assert_eq!(r[0]["result"]["enabled"], json!(false), "{}", r[0]);
     }
 
     #[tokio::test]
