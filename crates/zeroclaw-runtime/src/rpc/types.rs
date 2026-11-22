@@ -140,6 +140,8 @@ rpc_type! {
         pub allowed_tools: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub delete_after_run: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub uses_memory: Option<bool>,
     }
 }
 
