@@ -2692,16 +2692,64 @@ impl RpcDispatcher {
     /// owner recorded at `session/new` (this connection's signed TUI id)
     /// stands in for the in-memory owner. A live incarnation always wins, so
     /// a session reopened by another client is never reclaimed this way.
+    /// Code (ACP) sessions keep their remote owner in the ACP store, keyed by
+    /// the bare session id.
     fn owns_dormant_session(&self, session_id: &str) -> bool {
-        let (Some(tui_id), Some(backend)) =
-            (self.tui_id.as_deref(), self.ctx.session_backend.as_ref())
-        else {
+        let Some(tui_id) = self.tui_id.as_deref() else {
             return false;
         };
-        matches!(
-            backend.session_remote_owner(&format!("rpc_{session_id}")),
-            Ok(Some(owner)) if owner == tui_id
-        )
+        let chat = self.ctx.session_backend.as_ref().is_some_and(|backend| {
+            matches!(
+                backend.session_remote_owner(&format!("rpc_{session_id}")),
+                Ok(Some(owner)) if owner == tui_id
+            )
+        });
+        chat || self.ctx.acp_session_store.as_ref().is_some_and(|store| {
+            matches!(
+                store.session_remote_owner(session_id),
+                Ok(Some(owner)) if owner == tui_id
+            )
+        })
+    }
+
+    /// Record this remote client as the durable owner of `session_id`, in
+    /// the store of `chat_mode`, so it can find and resume the session while
+    /// it has no live incarnation (see [`Self::owns_dormant_session`]).
+    /// Called only once the caller holds the live incarnation. Attribution
+    /// for recovery only: a failure leaves today's behavior and is logged.
+    fn record_remote_owner(&self, session_id: &str, chat_mode: &ChatMode) {
+        if self.access_policy != RpcAccessPolicy::RemoteSessionOwner {
+            return;
+        }
+        let Some(tui_id) = self.tui_id.as_deref() else {
+            return;
+        };
+        let result = if matches!(chat_mode, ChatMode::Acp) {
+            self.ctx.acp_session_store.as_ref().map(|store| {
+                store
+                    .set_session_remote_owner(session_id, tui_id)
+                    .map_err(|e| e.to_string())
+            })
+        } else {
+            self.ctx.session_backend.as_ref().map(|backend| {
+                backend
+                    .set_session_remote_owner(&format!("rpc_{session_id}"), tui_id)
+                    .map_err(|e| e.to_string())
+            })
+        };
+        if let Some(Err(error)) = result {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "session_id": session_id,
+                        "error": error,
+                    })),
+                "session/new: could not record the remote owner on the persisted row"
+            );
+        }
     }
 
     async fn ensure_session_access(&self, session_id: &str) -> Result<(), JsonRpcError> {
@@ -2778,19 +2826,28 @@ impl RpcDispatcher {
             .await
             .into_iter()
             .collect();
-        // Dormant sessions this client created survive a restart; one that is
-        // live under any other owner stays hidden.
+        // Dormant sessions this client owns stay visible once they are no
+        // longer live (a restart, or orphan retirement while it was away);
+        // one that is live under any other owner stays hidden.
+        let mut dormant: Vec<String> = Vec::new();
         if let Some(backend) = self.ctx.session_backend.as_ref()
             && let Ok(keys) = backend.session_keys_for_remote_owner(tui_id)
         {
-            let live: std::collections::HashSet<String> =
-                self.ctx.sessions.list_ids().await.into_iter().collect();
-            visible.extend(
+            dormant.extend(
                 keys.iter()
                     .filter_map(|key| key.strip_prefix("rpc_"))
-                    .filter(|id| !live.contains(*id))
                     .map(str::to_string),
             );
+        }
+        if let Some(store) = self.ctx.acp_session_store.as_ref()
+            && let Ok(ids) = store.session_ids_for_remote_owner(tui_id)
+        {
+            dormant.extend(ids);
+        }
+        if !dormant.is_empty() {
+            let live: std::collections::HashSet<String> =
+                self.ctx.sessions.list_ids().await.into_iter().collect();
+            visible.extend(dormant.into_iter().filter(|id| !live.contains(id)));
         }
         Some(visible)
     }
@@ -4424,6 +4481,9 @@ impl RpcDispatcher {
     ) -> RpcResult {
         self.rebind_rpc_approval_channel(Arc::clone(&existing.agent), session_id.clone())
             .await?;
+        // The live rebind proved this remote client owns the incarnation, so a
+        // session created before its owner was recorded is recorded now.
+        self.record_remote_owner(&session_id, chat_mode);
         // Do not retain remote admission across outbound capacity or hooks.
         drop(admission);
         if matches!(chat_mode, crate::rpc::types::ChatMode::Acp) {
@@ -5529,28 +5589,9 @@ impl RpcDispatcher {
             );
         }
 
-        // Record the remote client that owns this chat session so it can find
-        // and resume it after a daemon restart (see `owns_dormant_session`).
-        // Attribution for recovery only: a failure leaves today's behavior.
-        if self.access_policy == RpcAccessPolicy::RemoteSessionOwner
-            && !matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
-            && let (Some(tui_id), Some(backend)) =
-                (self.tui_id.as_deref(), self.ctx.session_backend.as_ref())
-            && let Err(error) =
-                backend.set_session_remote_owner(&format!("rpc_{session_id}"), tui_id)
-        {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_category(::zeroclaw_log::EventCategory::Agent)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "session_id": session_id,
-                        "error": error.to_string(),
-                    })),
-                "session/new: could not record the remote owner on the persisted row"
-            );
-        }
+        // Record the remote client that owns this session so it can find and
+        // resume it once it is no longer live (see `owns_dormant_session`).
+        self.record_remote_owner(&session_id, &chat_mode);
 
         if let Some(ref tui_id) = self.tui_id
             && req.keep_siblings != Some(true)
@@ -34894,6 +34935,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_owner_finds_and_resumes_its_dormant_acp_session() {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let chat_backend =
+            Arc::new(zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&data_dir).unwrap());
+        let acp_store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(&data_dir).unwrap());
+        let ctx = RpcContext::for_persistence_tests(
+            config,
+            sessions,
+            Some(chat_backend as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            Some(Arc::clone(&acp_store)),
+        );
+        let (owner, _owner_rx) = make_remote_dispatcher(Arc::clone(&ctx), "tui-owner");
+        let (foreign, _foreign_rx) = make_remote_dispatcher(Arc::clone(&ctx), "tui-foreign");
+        let acp_new = |session_id: Option<&str>| {
+            let mut params = json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "exclude_memory": true,
+            });
+            if let Some(id) = session_id {
+                params["session_id"] = json!(id);
+            }
+            params
+        };
+        let listed = |value: Value| -> Vec<String> {
+            value["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|entry| entry["session_id"].as_str().map(str::to_string))
+                .collect()
+        };
+
+        let code = owner
+            .handle_session_new_for_test(&acp_new(None))
+            .await
+            .expect("owner ACP session creation must succeed")["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            acp_store.session_remote_owner(&code).unwrap().as_deref(),
+            Some("tui-owner"),
+            "a remote creator is recorded as the durable remote owner"
+        );
+
+        // Orphan retirement or a restart drops the live incarnation.
+        assert!(owner.ctx.sessions.remove(&code).await);
+        assert_eq!(
+            listed(owner.handle_session_list_acp(&json!({})).await.unwrap()),
+            std::slice::from_ref(&code)
+        );
+        assert!(listed(foreign.handle_session_list_acp(&json!({})).await.unwrap()).is_empty());
+
+        let denied = foreign
+            .handle_session_new_for_test(&acp_new(Some(&code)))
+            .await
+            .expect_err("another remote client must not resume a dormant session it does not own");
+        assert_eq!(denied.code, SESSION_NOT_OWNED);
+
+        let resumed = owner
+            .handle_session_new_for_test(&acp_new(Some(&code)))
+            .await
+            .expect("the recorded remote owner resumes its dormant ACP session");
+        assert_eq!(resumed["session_id"], code);
+        assert_eq!(
+            owner
+                .ctx
+                .sessions
+                .session_owner_tui_id(&code)
+                .await
+                .flatten()
+                .as_deref(),
+            Some("tui-owner")
+        );
+
+        // A session created before owners were recorded is recorded when its
+        // live owner reattaches, so it survives the next retirement too.
+        acp_store.set_session_remote_owner(&code, "").unwrap();
+        assert_eq!(acp_store.session_remote_owner(&code).unwrap(), None);
+        owner
+            .handle_session_new_for_test(&acp_new(Some(&code)))
+            .await
+            .expect("the live owner reattaches");
+        assert_eq!(
+            acp_store.session_remote_owner(&code).unwrap().as_deref(),
+            Some("tui-owner")
+        );
+    }
+
+    #[tokio::test]
     async fn remote_session_lists_only_return_the_callers_live_sessions() {
         use zeroclaw_infra::session_queue::SessionActorQueue;
 
@@ -34913,7 +35052,7 @@ mod tests {
             Some(acp_store),
         );
         let (mut owner, mut owner_rx) = make_remote_dispatcher(Arc::clone(&ctx), "tui-owner");
-        let (foreign, _foreign_rx) = make_remote_dispatcher(ctx, "tui-foreign");
+        let (mut foreign, mut foreign_rx) = make_remote_dispatcher(ctx, "tui-foreign");
 
         let owner_chat = owner
             .handle_session_new_for_test(&json!({"agent_alias": "test-agent"}))
@@ -34967,10 +35106,10 @@ mod tests {
         assert!(owner.ctx.sessions.remove(&owner_chat).await);
         assert!(owner.ctx.sessions.remove(&owner_acp).await);
 
-        // A reaped chat session keeps its durable remote owner, so its creator
-        // still lists it (resume is covered by
-        // `remote_owner_finds_and_resumes_its_dormant_chat_session_after_restart`).
-        // ACP sessions record no remote owner and stay unreachable.
+        // A reaped session keeps its durable remote owner, chat and ACP alike,
+        // so its creator still lists it (resume is covered by
+        // `remote_owner_finds_and_resumes_its_dormant_chat_session_after_restart`
+        // and `remote_owner_finds_and_resumes_its_dormant_acp_session`).
         let reaped_chat = owner.handle_session_list(&json!({})).await.unwrap();
         let reaped_chat_ids: Vec<&str> = reaped_chat["sessions"]
             .as_array()
@@ -34980,29 +35119,63 @@ mod tests {
             .collect();
         assert_eq!(reaped_chat_ids, [owner_chat.as_str()]);
         let reaped_acp = owner.handle_session_list_acp(&json!({})).await.unwrap();
-        assert!(reaped_acp["sessions"].as_array().unwrap().is_empty());
-        owner
-            .process_line_for_test(
-                &json!({
-                    "jsonrpc": "2.0",
-                    "id": "reaped-remote-prompt",
-                    "method": "session/prompt",
-                    "params": {
-                        "session_id": &owner_acp,
-                        "prompt": "must remain inaccessible",
-                    },
-                })
-                .to_string(),
-            )
+        let reaped_acp_ids: Vec<&str> = reaped_acp["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["session_id"].as_str())
+            .collect();
+        assert_eq!(reaped_acp_ids, [owner_acp.as_str()]);
+        let foreign_acp = foreign.handle_session_list_acp(&json!({})).await.unwrap();
+        assert!(
+            !foreign_acp["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["session_id"] == owner_acp),
+            "another remote client never sees the dormant session"
+        );
+        // Another remote client cannot prompt the dormant session...
+        let prompt = |id: &str| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "session/prompt",
+                "params": {
+                    "session_id": &owner_acp,
+                    "prompt": "hello",
+                },
+            })
+            .to_string()
+        };
+        foreign
+            .process_line_for_test(&prompt("foreign-dormant-prompt"))
             .await;
-        let response = tokio::time::timeout(std::time::Duration::from_secs(5), owner_rx.recv())
+        let denied = tokio::time::timeout(std::time::Duration::from_secs(5), foreign_rx.recv())
             .await
-            .expect("remote prompt must receive an ownership response")
-            .expect("remote response channel must stay open");
-        let response: Value = serde_json::from_str(&response).unwrap();
-        assert_eq!(response["id"], "reaped-remote-prompt");
-        assert_eq!(response["error"]["code"], SESSION_NOT_OWNED);
+            .expect("foreign prompt must receive an ownership response")
+            .expect("foreign response channel must stay open");
+        let denied: Value = serde_json::from_str(&denied).unwrap();
+        assert_eq!(denied["id"], "foreign-dormant-prompt");
+        assert_eq!(denied["error"]["code"], SESSION_NOT_OWNED);
         assert!(owner.ctx.sessions.get_agent(&owner_acp).await.is_none());
+
+        // ...while its recorded owner is admitted: the turn reaches the model
+        // (unavailable in this test) instead of the ownership denial.
+        owner
+            .process_line_for_test(&prompt("owner-dormant-prompt"))
+            .await;
+        let response = loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), owner_rx.recv())
+                .await
+                .expect("owner prompt must receive a response")
+                .expect("owner response channel must stay open");
+            let frame: Value = serde_json::from_str(&frame).unwrap();
+            if frame["id"] == "owner-dormant-prompt" {
+                break frame;
+            }
+        };
+        assert_ne!(response["error"]["code"], SESSION_NOT_OWNED, "{response}");
 
         let (local_tx, _local_rx) = tokio::sync::mpsc::channel(64);
         let local = RpcDispatcher::new(
