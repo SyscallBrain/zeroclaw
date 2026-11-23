@@ -392,6 +392,25 @@ pub trait SessionBackend: Send + Sync {
         ))
     }
 
+    /// Record the remote client (its signed TUI id) that owns an RPC
+    /// session, so a remote session owner can find and resume its dormant
+    /// sessions after a daemon restart. Live ownership stays in the session
+    /// store; this row is only consulted while no live incarnation exists.
+    /// Backends without the column keep today's behavior: no-op.
+    fn set_session_remote_owner(&self, _session_key: &str, _tui_id: &str) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// The remote owner recorded by [`Self::set_session_remote_owner`].
+    fn session_remote_owner(&self, _session_key: &str) -> std::io::Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Session keys whose recorded remote owner is `tui_id`.
+    fn session_keys_for_remote_owner(&self, _tui_id: &str) -> std::io::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
     /// Invoke a disclosure effect under the backend's owner-read boundary.
     fn with_session_owner(
         &self,

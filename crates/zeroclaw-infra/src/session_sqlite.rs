@@ -223,6 +223,10 @@ impl SqliteSessionBackend {
                 "principal_id",
                 "ALTER TABLE session_metadata ADD COLUMN principal_id TEXT",
             ),
+            (
+                "remote_owner_tui_id",
+                "ALTER TABLE session_metadata ADD COLUMN remote_owner_tui_id TEXT",
+            ),
         ] {
             Self::ensure_metadata_column(&tx, column, ddl)?;
         }
@@ -251,6 +255,11 @@ impl SqliteSessionBackend {
                 "idx_session_metadata_principal_id",
                 "CREATE INDEX IF NOT EXISTS idx_session_metadata_principal_id \
                  ON session_metadata(principal_id)",
+            ),
+            (
+                "idx_session_metadata_remote_owner_tui_id",
+                "CREATE INDEX IF NOT EXISTS idx_session_metadata_remote_owner_tui_id \
+                 ON session_metadata(remote_owner_tui_id)",
             ),
         ] {
             tx.execute(ddl, [])
@@ -1840,6 +1849,46 @@ impl SessionBackend for SqliteSessionBackend {
         Ok(())
     }
 
+    fn set_session_remote_owner(&self, session_key: &str, tui_id: &str) -> std::io::Result<()> {
+        let conn = self.conn.lock();
+        let owner = (!tui_id.is_empty()).then_some(tui_id);
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count, remote_owner_tui_id)
+             VALUES (?1, ?2, ?3, 0, ?4)
+             ON CONFLICT(session_key) DO UPDATE SET remote_owner_tui_id = excluded.remote_owner_tui_id",
+            params![session_key, now, now, owner],
+        )
+        .map_err(std::io::Error::other)?;
+        Ok(())
+    }
+
+    fn session_remote_owner(&self, session_key: &str) -> std::io::Result<Option<String>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT remote_owner_tui_id FROM session_metadata WHERE session_key = ?1",
+            params![session_key],
+            |row| row.get(0),
+        )
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(std::io::Error::other(other)),
+        })
+    }
+
+    fn session_keys_for_remote_owner(&self, tui_id: &str) -> std::io::Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT session_key FROM session_metadata WHERE remote_owner_tui_id = ?1 ORDER BY session_key")
+            .map_err(std::io::Error::other)?;
+        let keys = stmt
+            .query_map(params![tui_id], |row| row.get::<_, String>(0))
+            .map_err(std::io::Error::other)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(std::io::Error::other)?;
+        Ok(keys)
+    }
+
     fn get_session_agent_alias(&self, session_key: &str) -> std::io::Result<Option<String>> {
         let conn = self.conn.lock();
         conn.query_row(
@@ -1903,6 +1952,55 @@ impl SessionBackend for SqliteSessionBackend {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn remote_owner_is_recorded_and_listed_per_tui() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.set_session_agent_alias("rpc_a", "test").unwrap();
+        backend
+            .set_session_remote_owner("rpc_a", "tui-phone")
+            .unwrap();
+        backend
+            .set_session_remote_owner("rpc_b", "tui-other")
+            .unwrap();
+        assert_eq!(
+            backend.session_remote_owner("rpc_a").unwrap().as_deref(),
+            Some("tui-phone")
+        );
+        assert_eq!(backend.session_remote_owner("rpc_missing").unwrap(), None);
+        assert_eq!(
+            backend.session_keys_for_remote_owner("tui-phone").unwrap(),
+            vec!["rpc_a".to_string()]
+        );
+        assert!(
+            backend
+                .session_keys_for_remote_owner("tui-nobody")
+                .unwrap()
+                .is_empty()
+        );
+        // Recording the owner never touches the attribution columns.
+        assert_eq!(
+            backend.get_session_agent_alias("rpc_a").unwrap().as_deref(),
+            Some("test")
+        );
+    }
+
+    #[test]
+    fn remote_owner_survives_reopening_the_database() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        {
+            let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+            backend
+                .set_session_remote_owner("rpc_a", "tui-phone")
+                .unwrap();
+        }
+        let reopened = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert_eq!(
+            reopened.session_remote_owner("rpc_a").unwrap().as_deref(),
+            Some("tui-phone")
+        );
+    }
+
     #[test]
     fn guarded_state_and_delete_recheck_owner_and_authority_after_connection_wait() {
         use std::sync::{

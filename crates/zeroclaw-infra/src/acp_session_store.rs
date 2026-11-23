@@ -291,6 +291,9 @@ impl AcpSessionStore {
         Self::ensure_retained_context_columns(&conn)
             .context("Failed to migrate ACP retained context columns")?;
 
+        Self::ensure_remote_owner_column(&conn)
+            .context("Failed to migrate ACP session remote owner")?;
+
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -340,6 +343,85 @@ impl AcpSessionStore {
         )
         .context("Failed to index ACP session principal owner")?;
         Ok(())
+    }
+
+    /// Add the `remote_owner_tui_id` column on upgrade: the signed TUI id of
+    /// the remote (WSS) client that owns the session, so that client can find
+    /// and resume it while it has no live incarnation. Existing rows keep a
+    /// NULL remote owner, which is today's behavior.
+    fn ensure_remote_owner_column(conn: &Connection) -> Result<()> {
+        let column_present = conn
+            .prepare("PRAGMA table_info(acp_sessions)")
+            .context("Failed to inspect ACP session schema")?
+            .query_map([], |row| row.get::<_, String>(1))
+            .context("Failed to read ACP session schema")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("Failed to read ACP session column name")?
+            .iter()
+            .any(|column| column == "remote_owner_tui_id");
+        // Column and index are one migration; see `ensure_principal_id_column`.
+        if !column_present {
+            match conn.execute(
+                "ALTER TABLE acp_sessions ADD COLUMN remote_owner_tui_id TEXT",
+                [],
+            ) {
+                Ok(_) => {}
+                Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+                    if msg.contains("duplicate column name") => {}
+                Err(e) => return Err(e).context("Failed to add ACP session remote owner"),
+            }
+        }
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_acp_sessions_remote_owner \
+             ON acp_sessions(remote_owner_tui_id)",
+            [],
+        )
+        .context("Failed to index ACP session remote owner")?;
+        Ok(())
+    }
+
+    /// Record the remote client (its signed TUI id) that owns a session.
+    /// Live ownership stays in the RPC session store; this is consulted only
+    /// while the session has no live incarnation. A missing row is a no-op.
+    pub fn set_session_remote_owner(&self, session_uuid: &str, tui_id: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        let owner = (!tui_id.is_empty()).then_some(tui_id);
+        conn.execute(
+            "UPDATE acp_sessions SET remote_owner_tui_id = ?2 WHERE session_uuid = ?1",
+            params![session_uuid, owner],
+        )
+        .context("Failed to record ACP session remote owner")?;
+        Ok(())
+    }
+
+    /// The remote owner recorded by [`Self::set_session_remote_owner`].
+    pub fn session_remote_owner(&self, session_uuid: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT remote_owner_tui_id FROM acp_sessions WHERE session_uuid = ?1",
+            params![session_uuid],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map(Option::flatten)
+        .context("Failed to query ACP session remote owner")
+    }
+
+    /// Sessions whose recorded remote owner is `tui_id`, killed ones excluded.
+    pub fn session_ids_for_remote_owner(&self, tui_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT session_uuid FROM acp_sessions \
+                 WHERE remote_owner_tui_id = ?1 AND killed_at IS NULL \
+                 ORDER BY session_uuid",
+            )
+            .context("Failed to prepare ACP remote owner query")?;
+        let rows = stmt
+            .query_map(params![tui_id], |row| row.get::<_, String>(0))
+            .context("Failed to query ACP sessions by remote owner")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("Failed to read ACP sessions by remote owner")
     }
 
     fn ensure_killed_at_column(conn: &Connection) -> Result<()> {
