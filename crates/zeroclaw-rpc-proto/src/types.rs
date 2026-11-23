@@ -650,6 +650,28 @@ rpc_type! {
         pub command: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub prompt: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub enabled: Option<bool>,
+        /// A cron `DeliveryConfig` object (`mode`, `channel`, `to`, `best_effort`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub delivery: Option<Value>,
+        /// Agent jobs only. Blank is rejected; use `clear_model`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub model: Option<String>,
+        /// Agent jobs only: back to the agent's own model.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub clear_model: Option<bool>,
+        /// Agent jobs only: `isolated` or `main`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub session_target: Option<String>,
+        /// Agent jobs only. Empty is rejected; use `clear_allowed_tools`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub allowed_tools: Option<Vec<String>>,
+        /// Agent jobs only: back to the agent's normal tool set.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub clear_allowed_tools: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub uses_memory: Option<bool>,
     }
 }
 

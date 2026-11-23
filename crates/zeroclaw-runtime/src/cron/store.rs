@@ -234,6 +234,39 @@ pub fn add_agent_job(
     allowed_tools: Option<Vec<String>>,
     uses_memory: bool,
 ) -> Result<CronJob> {
+    add_agent_job_authorized(
+        config,
+        agent_alias,
+        name,
+        schedule,
+        prompt,
+        session_target,
+        model,
+        delivery,
+        delete_after_run,
+        allowed_tools,
+        uses_memory,
+        || Ok(()),
+    )
+}
+
+/// Like [`add_agent_job`], with `authorize` resolved after SQLite grants the
+/// writer and held through the insert and its commit, as the shell path does.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn add_agent_job_authorized<G>(
+    config: &Config,
+    agent_alias: &str,
+    name: Option<String>,
+    schedule: Schedule,
+    prompt: &str,
+    session_target: SessionTarget,
+    model: Option<String>,
+    delivery: Option<DeliveryConfig>,
+    delete_after_run: bool,
+    allowed_tools: Option<Vec<String>>,
+    uses_memory: bool,
+    authorize: impl FnOnce() -> Result<G>,
+) -> Result<CronJob> {
     let now = Utc::now();
     validate_schedule(&schedule, now)?;
     validate_delivery_config(delivery.as_ref())?;
@@ -248,7 +281,9 @@ pub fn add_agent_job(
     }
 
     with_initialized_connection(config, |conn| {
-        conn.execute(
+        let tx = begin_immediate(conn, "agent job insert")?;
+        let _authority = authorize()?;
+        tx.execute(
             "INSERT INTO cron_jobs (
                 id, expression, command, schedule, job_type, prompt, name, session_target, model,
                 enabled, delivery, delete_after_run, allowed_tools, agent_alias, created_at, next_run,
@@ -272,7 +307,7 @@ pub fn add_agent_job(
             ],
         )
         .context("Failed to insert cron agent job")?;
-        Ok(())
+        tx.commit().context("Failed to commit cron agent job")
     })?;
 
     get_job(config, &id)
@@ -847,7 +882,13 @@ pub(crate) fn update_job_authorized<G>(
             job.delivery = delivery;
         }
         if let Some(model) = patch.model {
-            job.model = Some(model);
+            // Blank means "clear the override" (the agent's model), mirroring
+            // how an empty allowed_tools list clears the allowlist below.
+            job.model = if model.trim().is_empty() {
+                None
+            } else {
+                Some(model)
+            };
         }
         if let Some(target) = patch.session_target {
             job.session_target = target;
@@ -2936,6 +2977,88 @@ mod tests {
         claim_job_in_config(&mut config, "test-agent", true, &[]);
         std::fs::create_dir_all(&config.data_dir).unwrap();
         config
+    }
+
+    fn every_five() -> Schedule {
+        Schedule::Cron {
+            expr: "*/5 * * * *".into(),
+            tz: None,
+        }
+    }
+
+    #[test]
+    fn agent_job_authorize_runs_inside_the_insert() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let refused = add_agent_job_authorized(
+            &config,
+            "test-agent",
+            None,
+            every_five(),
+            "hi",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+            || -> Result<()> { anyhow::bail!("authority gone") },
+        );
+        assert!(
+            refused.unwrap_err().to_string().contains("authority gone"),
+            "the authorize error must propagate"
+        );
+        assert!(
+            list_jobs(&config).unwrap().is_empty(),
+            "a refused authorize must not leave a row"
+        );
+
+        let job = add_agent_job_authorized(
+            &config,
+            "test-agent",
+            None,
+            every_five(),
+            "hi",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(job.job_type, JobType::Agent);
+    }
+
+    #[test]
+    fn patch_empty_model_clears_it() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_agent_job(
+            &config,
+            "test-agent",
+            None,
+            every_five(),
+            "hi",
+            SessionTarget::Isolated,
+            Some("x".into()),
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+        update_job(
+            &config,
+            &job.id,
+            CronJobPatch {
+                model: Some(String::new()),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(get_job(&config, &job.id).unwrap().model, None);
     }
 
     #[test]

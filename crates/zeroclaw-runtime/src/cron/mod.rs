@@ -16,6 +16,7 @@ pub mod scheduler;
 pub use schedule::{
     next_run_for_schedule, normalize_expression, schedule_cron_expression, validate_schedule,
 };
+pub(crate) use store::add_agent_job_authorized;
 #[allow(unused_imports)]
 pub use store::{
     RunOutcomes, RunProvenance, add_agent_job, all_overdue_jobs, claim_job, claim_job_for_agent,

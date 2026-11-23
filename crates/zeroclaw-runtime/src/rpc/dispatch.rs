@@ -9848,6 +9848,13 @@ impl RpcDispatcher {
         let config_writer_guard = self.ctx.config_authority.lock_config_writer().await;
         self.recheck_cron_write_authority(Method::CronAdd, &req.agent, true, &config_writer_guard)?;
         let config = self.ctx.config.read().clone();
+        // Same inference as the gateway: explicit "agent", or a prompt with no type.
+        let is_agent = matches!(req.job_type.as_deref(), Some("agent"))
+            || (req.job_type.is_none() && req.prompt.is_some());
+        if is_agent {
+            // `_reservation` and `config_writer_guard` stay held until this returns.
+            return self.add_cron_agent_job(req, &config);
+        }
         let schedule = Schedule::Cron {
             expr: req.schedule,
             tz: req.tz,
@@ -9894,10 +9901,141 @@ impl RpcDispatcher {
         to_result(job)
     }
 
+    /// The agent-job branch of `cron/add`. Runs under the caller's alias
+    /// reservation and config writer gate. Agent jobs rebuild tools without
+    /// the caller's principal, so only an admin principal may create one; the
+    /// grant is checked again under the SQLite writer, as the shell path does.
+    fn add_cron_agent_job(
+        &self,
+        req: CronAddParams,
+        config: &zeroclaw_config::schema::Config,
+    ) -> RpcResult {
+        let schedule = Schedule::Cron {
+            expr: req.schedule.clone(),
+            tz: req.tz.clone(),
+        };
+        let denied_principal = || {
+            let denied = crate::rpc::auth::AuthDenied::forbidden(
+                crate::i18n::get_required_cli_string("rpc-cron-agent-principal-required"),
+            );
+            self.audit_auth_denial(Method::CronAdd, &denied);
+            rpc_err(denied.code, denied.message)
+        };
+        if !self
+            .recheck_authority_after_admission(Method::CronAdd)?
+            .is_some_and(|grants| grants.admin)
+        {
+            return Err(denied_principal());
+        }
+        let prompt = match req.prompt.as_deref().map(str::trim) {
+            Some(prompt) if !prompt.is_empty() => prompt.to_string(),
+            _ => return Err(rpc_err(INVALID_PARAMS, "Missing 'prompt' for agent job")),
+        };
+        let session_target = match req.session_target.as_deref() {
+            Some(raw) => crate::cron::SessionTarget::try_parse(raw)
+                .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cron add rejected: {e}")))?,
+            None => crate::cron::SessionTarget::Isolated,
+        };
+        let auth = self.auth.as_ref().ok_or_else(|| {
+            rpc_err(
+                AUTH_REQUIRED,
+                crate::i18n::get_required_cli_string("rpc-auth-first-call-initialize"),
+            )
+        })?;
+        let mut denied = None;
+        let job = crate::cron::add_agent_job_authorized(
+            config,
+            &req.agent,
+            req.name,
+            schedule,
+            &prompt,
+            session_target,
+            req.model.filter(|model| !model.trim().is_empty()),
+            req.delivery,
+            req.delete_after_run.unwrap_or(false),
+            req.allowed_tools.filter(|tools| !tools.is_empty()),
+            req.uses_memory.unwrap_or(true),
+            || {
+                let authority = self.ctx.auth.hold_authority();
+                match current_authority_under(&authority, auth, Method::CronAdd) {
+                    Ok(grants) if grants.admin => Ok(authority),
+                    Ok(_) => {
+                        let error = denied_principal();
+                        let message = error.message.clone();
+                        denied = Some(error);
+                        Err(anyhow::Error::msg(message))
+                    }
+                    Err(error) => {
+                        self.audit_auth_denial(Method::CronAdd, &error);
+                        let message = error.message.clone();
+                        denied = Some(rpc_err(error.code, error.message));
+                        Err(anyhow::Error::msg(message))
+                    }
+                }
+            },
+        );
+        if let Some(error) = denied {
+            return Err(error);
+        }
+        let job = job.map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron add failed: {e}")))?;
+        to_result(job)
+    }
+
     async fn handle_cron_patch(&self, params: &Value) -> RpcResult {
         let req: CronPatchParams = parse_params(params)?;
         self.selector_agent(Method::CronPatch, &req.agent)?;
+        if req.model.as_deref().is_some_and(|model| model.trim().is_empty()) {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "Cron patch rejected: model is blank; send clear_model to drop the override",
+            ));
+        }
+        if req.allowed_tools.as_ref().is_some_and(Vec::is_empty) {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "Cron patch rejected: allowed_tools is empty; send clear_allowed_tools to drop the allowlist",
+            ));
+        }
+        let session_target = req
+            .session_target
+            .as_deref()
+            .map(crate::cron::SessionTarget::try_parse)
+            .transpose()
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cron patch rejected: {e}")))?;
+        let delivery = req
+            .delivery
+            .clone()
+            .map(serde_json::from_value::<crate::cron::DeliveryConfig>)
+            .transpose()
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cron patch rejected: delivery: {e}")))?;
+        let touches_agent_fields = req.model.is_some()
+            || req.clear_model == Some(true)
+            || session_target.is_some()
+            || req.allowed_tools.is_some()
+            || req.clear_allowed_tools == Some(true);
+        let not_for_shell = || {
+            rpc_err(
+                INVALID_PARAMS,
+                "Cron patch rejected: model, session_target and allowed_tools are not applicable to shell jobs",
+            )
+        };
         let patch = CronJobPatch {
+            enabled: req.enabled,
+            delivery,
+            // The store reads a blank model as "clear the override".
+            model: if req.clear_model == Some(true) {
+                Some(String::new())
+            } else {
+                req.model.clone()
+            },
+            session_target,
+            // The store reads an empty list as "clear the allowlist".
+            allowed_tools: if req.clear_allowed_tools == Some(true) {
+                Some(Vec::new())
+            } else {
+                req.allowed_tools.clone()
+            },
+            uses_memory: req.uses_memory,
             schedule: req.schedule.map(|s| Schedule::Cron {
                 expr: s,
                 tz: if req.clear_tz == Some(true) {
@@ -9919,6 +10057,9 @@ impl RpcDispatcher {
             let config = self.ctx.config.read().clone();
             self.authorize_cron_job(Method::CronPatch, &config, &req.id)?
         };
+        if touches_agent_fields && owner.job_type != crate::cron::JobType::Agent {
+            return Err(not_for_shell());
+        }
         // Held through the update: see `recheck_cron_write_authority`. The
         // config is read again under it, so the command is validated against
         // the policy the write commits under.
@@ -9963,6 +10104,9 @@ impl RpcDispatcher {
                             crate::cron::job_not_found(&req.id)
                         ),
                     ));
+                }
+                if touches_agent_fields && job.job_type != crate::cron::JobType::Agent {
+                    return Err(not_for_shell());
                 }
                 if job.job_type == crate::cron::JobType::Agent && !grants.admin {
                     return Err(rpc_err(
@@ -16932,6 +17076,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cron_add_agent_job_round_trips() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        let ctx = enforcement_ctx(config.clone());
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+        let response = rpc(
+            &mut operator,
+            &mut rx,
+            1,
+            "cron/add",
+            json!({
+                "agent": "alpha", "schedule": "0 9 * * *", "job_type": "agent", "prompt": "hi",
+                "model": "m", "session_target": "main", "allowed_tools": ["shell"], "uses_memory": false,
+                "delivery": {"mode": "announce", "channel": "telegram.main", "to": "1"}
+            }),
+        )
+        .await;
+        let job = &response["result"];
+        assert_eq!(job["job_type"], json!("agent"), "{response}");
+        assert_eq!(job["prompt"], json!("hi"));
+        assert_eq!(job["model"], json!("m"));
+        assert_eq!(job["session_target"], json!("main"));
+        assert_eq!(job["allowed_tools"], json!(["shell"]));
+        assert_eq!(job["uses_memory"], json!(false));
+        assert_eq!(job["delivery"]["channel"], json!("telegram.main"));
+    }
+
+    #[tokio::test]
+    async fn cron_add_agent_job_requires_admin() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        let ctx = enforcement_ctx(config.clone());
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let response = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "cron/add",
+            json!({"agent": "alpha", "schedule": "0 9 * * *", "job_type": "agent", "prompt": "hi"}),
+        )
+        .await;
+        assert_eq!(response["error"]["code"], json!(FORBIDDEN), "{response}");
+        assert!(crate::cron::list_jobs(&config).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cron_add_agent_job_rejects_blank_prompt_and_bad_session_target() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        let ctx = enforcement_ctx(config.clone());
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+        for (id, params) in [
+            (1u64, json!({"agent": "alpha", "schedule": "0 9 * * *", "job_type": "agent", "prompt": "  "})),
+            (2, json!({"agent": "alpha", "schedule": "0 9 * * *", "job_type": "agent", "prompt": "hi", "session_target": "nope"})),
+        ] {
+            let response = rpc(&mut operator, &mut rx, id, "cron/add", params).await;
+            assert_eq!(response["error"]["code"], json!(INVALID_PARAMS), "{response}");
+        }
+        assert!(crate::cron::list_jobs(&config).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cron_add_infers_agent_from_prompt_and_keeps_shell_jobs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        let ctx = enforcement_ctx(config.clone());
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+        let response = rpc(
+            &mut operator,
+            &mut rx,
+            1,
+            "cron/add",
+            json!({"agent": "alpha", "schedule": "0 9 * * *", "prompt": "hi"}),
+        )
+        .await;
+        assert_eq!(response["result"]["job_type"], json!("agent"), "{response}");
+        let response = rpc(
+            &mut operator,
+            &mut rx,
+            2,
+            "cron/add",
+            json!({"agent": "alpha", "schedule": "0 9 * * *", "command": "echo hi"}),
+        )
+        .await;
+        assert_eq!(response["result"]["job_type"], json!("shell"), "{response}");
+    }
+
+    #[tokio::test]
     async fn cron_add_requires_the_agent_selector() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = cron_roster_config_in(&tmp, 4242);
@@ -16967,6 +17199,110 @@ mod tests {
             json!("alpha"),
             "{response}"
         );
+    }
+
+    async fn patch_as_operator(
+        config: &zeroclaw_config::schema::Config,
+        job: &crate::cron::CronJob,
+        patches: Vec<Value>,
+    ) -> Vec<Value> {
+        let ctx = enforcement_ctx(config.clone());
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+        let mut out = Vec::new();
+        for (i, mut patch) in patches.into_iter().enumerate() {
+            patch["id"] = json!(job.id);
+            patch["agent"] = json!(job.agent_alias);
+            out.push(rpc(&mut operator, &mut rx, i as u64 + 1, "cron/patch", patch).await);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn cron_patch_pauses_and_resumes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        let job = seed_cron_job(&config, "alpha", "alpha-job");
+        let r = patch_as_operator(&config, &job, vec![json!({"enabled": false}), json!({"enabled": true})]).await;
+        assert_eq!(r[0]["result"]["enabled"], json!(false), "{}", r[0]);
+        assert_eq!(r[1]["result"]["enabled"], json!(true), "{}", r[1]);
+    }
+
+    #[tokio::test]
+    async fn cron_patch_changes_delivery_session_and_memory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        let job = seed_cron_job(&config, "alpha", "alpha-job");
+        let r = patch_as_operator(
+            &config,
+            &job,
+            vec![json!({
+                "delivery": {"mode": "announce", "channel": "telegram.main", "to": "7"},
+                "session_target": "main", "uses_memory": true
+            })],
+        )
+        .await;
+        let result = &r[0]["result"];
+        assert_eq!(result["delivery"]["mode"], json!("announce"), "{}", r[0]);
+        assert_eq!(result["delivery"]["to"], json!("7"));
+        assert_eq!(result["session_target"], json!("main"));
+        assert_eq!(result["uses_memory"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn cron_patch_sets_and_clears_model_and_tools() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        let job = seed_cron_job(&config, "alpha", "alpha-job");
+        let r = patch_as_operator(
+            &config,
+            &job,
+            vec![
+                json!({"model": "m", "allowed_tools": ["shell"]}),
+                json!({"clear_model": true, "clear_allowed_tools": true}),
+            ],
+        )
+        .await;
+        assert_eq!(r[0]["result"]["model"], json!("m"), "{}", r[0]);
+        assert_eq!(r[0]["result"]["allowed_tools"], json!(["shell"]));
+        assert_eq!(r[1]["result"]["model"], Value::Null, "{}", r[1]);
+        assert_eq!(r[1]["result"]["allowed_tools"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn cron_patch_rejects_blank_model_and_empty_tools() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        let job = seed_cron_job(&config, "alpha", "alpha-job");
+        let r = patch_as_operator(&config, &job, vec![json!({"model": " "}), json!({"allowed_tools": []})]).await;
+        for response in &r {
+            assert_eq!(response["error"]["code"], json!(INVALID_PARAMS), "{response}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cron_patch_rejects_agent_fields_on_a_shell_job() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        let job = seed_shell_cron_job(&config, "alpha", "shell-job");
+        let r = patch_as_operator(
+            &config,
+            &job,
+            vec![
+                json!({"model": "m"}),
+                json!({"session_target": "main"}),
+                json!({"allowed_tools": ["shell"]}),
+                json!({"clear_model": true}),
+            ],
+        )
+        .await;
+        for response in &r {
+            assert_eq!(response["error"]["code"], json!(INVALID_PARAMS), "{response}");
+        }
+        let stored = crate::cron::get_job(&config, &job.id).unwrap();
+        assert_eq!(stored.model, None);
+        // A shell job may still be paused.
+        let r = patch_as_operator(&config, &job, vec![json!({"enabled": false})]).await;
+        assert_eq!(r[0]["result"]["enabled"], json!(false), "{}", r[0]);
     }
 
     #[tokio::test]
