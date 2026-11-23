@@ -1,0 +1,103 @@
+# Builds zerocode (the ZeroClaw TUI, apps/zerocode) for Termux
+# (aarch64-linux-android), only when it is started by hand. Nothing is
+# published: the binary is kept as a run artifact for 7 days.
+#
+# It does not sync anything: it builds the branch given in "ref" as it is in
+# this fork. To build zerocode on top of a fresh upstream, run
+# phone-build.yml (mode=sync) first, which updates android-master-zerodroid.
+#
+# Start it (from Termux, or anywhere with gh):
+#   gh workflow run zerocode-build.yml -R SyscallBrain/zeroclaw
+#   gh workflow run zerocode-build.yml -R SyscallBrain/zeroclaw -f ref=master -f checks=true
+# Follow it and fetch the binary from that same run (the newest run of this
+# workflow; gh run download without a run id would ask which run):
+#   run=$(gh run list -R SyscallBrain/zeroclaw -w zerocode-build.yml -L 1 --json databaseId -q '.[0].databaseId')
+#   gh run watch "$run" -R SyscallBrain/zeroclaw --exit-status
+#   gh run download "$run" -R SyscallBrain/zeroclaw
+# Artifacts are zips, which drop the executable bit, so then:
+#   chmod +x zerocode-*/zerocode
+name: zerocode build (manual)
+
+# The only trigger is "Run workflow" / "gh workflow run".
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit of this fork to build
+        type: string
+        default: android-master-zerodroid
+      checks:
+        description: Run zerocode's tests (on the x86_64 runner) before building
+        type: boolean
+        default: false
+
+permissions: {}
+
+env:
+  RUST_VERSION: 1.99.1
+  TARGET: aarch64-linux-android
+  NDK_VERSION: 29.0.14206865
+  CARGO_TERM_COLOR: always
+
+jobs:
+  zerocode:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      # Full history and upstream tags so "git describe" names the build.
+      - name: Check out the fork
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch the upstream tags
+        run: git fetch --quiet --tags https://github.com/zeroclaw-labs/zeroclaw.git master
+
+      - name: Install Rust and the Android NDK
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --target "$TARGET"
+          rustup default "$RUST_VERSION"
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" > /dev/null
+          # zeroclaw's .cargo/config.toml links with aarch64-linux-android21-clang:
+          # putting the NDK's bin directory on PATH is all it needs.
+          echo "$ANDROID_HOME/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: zerocode-${{ env.TARGET }}
+
+      - name: Tests
+        if: inputs.checks
+        run: cargo test --locked -p zerocode
+
+      - name: Build zerocode
+        run: cargo build --release --locked --target "$TARGET" -p zerocode --bin zerocode
+
+      - name: Label the binary
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          bin="target/$TARGET/release/zerocode"
+          file "$bin"
+          describe=$(git describe --tags --always)
+          echo "DESCRIBE=$describe" >> "$GITHUB_ENV"
+          mkdir out
+          cp "$bin" out/zerocode
+          {
+            echo "git describe: $describe"
+            echo "ref:          $REF @ $(git rev-parse HEAD)"
+            echo "run:          $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          } > out/BUILD-INFO.txt
+          (cd out && sha256sum zerocode > SHA256SUMS && cat SHA256SUMS BUILD-INFO.txt)
+
+      - name: Upload the binary
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: zerocode-${{ env.DESCRIBE }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 7
