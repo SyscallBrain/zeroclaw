@@ -17,10 +17,12 @@
 #   gh workflow run phone-build.yml -R SyscallBrain/zeroclaw                    # sync + publish
 #   gh workflow run phone-build.yml -R SyscallBrain/zeroclaw -f publish=false   # try without touching the fork
 #   gh workflow run phone-build.yml -R SyscallBrain/zeroclaw -f mode=build
-# Follow it and fetch the binary (artifacts are zips, which drop the
-# executable bit):
-#   gh run watch -R SyscallBrain/zeroclaw --exit-status
-#   gh run download -R SyscallBrain/zeroclaw --pattern 'zeroclaw-*'
+# Follow it and fetch the binary from that same run (the newest run of this
+# workflow; gh run download without a run id would ask which run):
+#   run=$(gh run list -R SyscallBrain/zeroclaw -w phone-build.yml -L 1 --json databaseId -q '.[0].databaseId')
+#   gh run watch "$run" -R SyscallBrain/zeroclaw --exit-status
+#   gh run download "$run" -R SyscallBrain/zeroclaw
+# Artifacts are zips, which drop the executable bit, so then:
 #   chmod +x zeroclaw-*/zeroclaw
 #
 # This file lives on "phone-ci", the fork's default branch, which holds only
