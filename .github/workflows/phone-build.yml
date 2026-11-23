@@ -88,6 +88,17 @@ jobs:
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/share/swift /usr/local/share/boost
           df -h /
 
+      # The fat-LTO link of the daemon does not fit in the runner's 16 GB of
+      # RAM: without extra swap the runner is killed and the run only says
+      # "The operation was canceled".
+      - name: Add swap
+        run: |
+          sudo fallocate -l 16G /swapfile-build
+          sudo chmod 600 /swapfile-build
+          sudo mkswap /swapfile-build > /dev/null
+          sudo swapon /swapfile-build
+          free -h
+
       - name: Check the push token
         if: inputs.mode == 'sync' && inputs.publish
         env:
@@ -168,11 +179,15 @@ jobs:
         with:
           key: ${{ env.TARGET }}
 
+      # Three parallel jobs, not four, to keep the memory peak lower.
       - name: Build the daemon
+        env:
+          CARGO_BUILD_JOBS: 3
         run: |
           features=$(printf "%s" "$FEATURES" | tr -s " " ",")
           cargo build --release --locked --target "$TARGET" \
             --no-default-features --features "$features" --bin zeroclaw
+          free -h
 
       - name: Label the binary
         env:
