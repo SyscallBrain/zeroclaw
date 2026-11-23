@@ -1,0 +1,219 @@
+# Daemon ZeroClaw do telemóvel (Termux, aarch64-linux-android), SÓ quando o
+# dono o lança à mão. Não publica nada: o binário fica como "artifact" do run
+# e é apagado ao fim de 7 dias.
+#
+# Os dois modos:
+#   sincronizar  1. vai buscar o master do upstream (zeroclaw-labs/zeroclaw);
+#                2. faz rebase de cada branch de patches (lista PATCHES) sobre ele;
+#                3. recria o branch do telemóvel = master + merge --no-ff de cada patch;
+#                4. compila;
+#                5. só se tudo correu bem, e com publicar=true, faz push para o
+#                   fork: master, os branches de patches e o branch do telemóvel.
+#                Se um rebase der conflito, o run pára e diz em que patch e em
+#                que ficheiros. O fork fica intacto. Ver a nota "GitHub Actions"
+#                no Obsidian para resolver o conflito à mão.
+#   compilar     compila o branch do telemóvel tal como está no fork, sem mexer em nada.
+#
+# Lançar (no Termux, ou em qualquer sítio com o gh):
+#   gh workflow run phone-build.yml -R SyscallBrain/zeroclaw                       # sincronizar + publicar
+#   gh workflow run phone-build.yml -R SyscallBrain/zeroclaw -f publicar=false     # experimentar sem tocar no fork
+#   gh workflow run phone-build.yml -R SyscallBrain/zeroclaw -f modo=compilar
+# Seguir e descarregar:
+#   gh run watch -R SyscallBrain/zeroclaw --exit-status
+#   gh run download -R SyscallBrain/zeroclaw --pattern 'zeroclaw-*'
+#
+# Este ficheiro vive no branch "phone-ci" (o branch por omissão do fork), que
+# só tem isto e um README. Assim o master do fork continua igual ao upstream.
+name: Phone daemon build (manual)
+
+# Único gatilho: o botão "Run workflow" ou o "gh workflow run".
+on:
+  workflow_dispatch:
+    inputs:
+      modo:
+        description: sincronizar = upstream + patches e compila; compilar = só compila o branch do telemóvel
+        type: choice
+        options: [sincronizar, compilar]
+        default: sincronizar
+      publicar:
+        description: (só no modo sincronizar) depois de compilar sem erros, fazer push dos branches para o fork
+        type: boolean
+        default: true
+
+# O token automático só lê. Os pushes usam o secret ZEROCLAW_PUSH_TOKEN (ver
+# mais abaixo porque é que o token automático não chega).
+permissions:
+  contents: read
+
+# Dois runs ao mesmo tempo podiam empurrar branches diferentes: o segundo
+# espera que o primeiro acabe.
+concurrency:
+  group: phone-daemon
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: https://github.com/zeroclaw-labs/zeroclaw.git
+  # Branch que o telemóvel corre.
+  PHONE_BRANCH: android-master-zerodroid
+  # Branches de patches, aplicados por esta ordem. Para acrescentar ou retirar
+  # um patch basta editar esta lista.
+  PATCHES: >-
+    zerodroid/remote-durable-session-owner
+    zerodroid/cron-rpc-parity
+    zerodroid/android-process-cpu
+  RUST_VERSION: 1.99.1
+  TARGET: aarch64-linux-android
+  NDK_VERSION: 29.0.14206865
+  # As mesmas features do binário que estava no telemóvel (default + extras).
+  FEATURES: >-
+    acp-bridge agent-runtime channel-acp-server channel-discord channel-email
+    channel-filesystem channel-git channel-lark channel-matrix channel-telegram
+    channel-webhook gateway observability-prometheus schema-export
+    tool-claude-code tool-claude-code-runner tool-codex-cli tool-composio
+    tool-gemini-cli tool-google-workspace tool-jira tool-linkedin
+    tool-microsoft365 tool-notion tool-opencode-cli tool-project-intel
+    tools-external
+  CARGO_TERM_COLOR: always
+
+jobs:
+  daemon:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      # O build com LTO ocupa muitos GB; isto liberta espaço que não usamos.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/share/swift /usr/local/share/boost
+          df -h /
+
+      - name: Check the push token
+        if: inputs.modo == 'sincronizar' && inputs.publicar
+        env:
+          PUSH_TOKEN: ${{ secrets.ZEROCLAW_PUSH_TOKEN }}
+        run: |
+          if [ -z "$PUSH_TOKEN" ]; then
+            echo "::error::Falta o secret ZEROCLAW_PUSH_TOKEN. Corre com -f publicar=false ou cria o token (ver a nota)."
+            exit 1
+          fi
+
+      # Histórico completo (fetch-depth 0): o rebase e o "git describe" precisam dele.
+      - name: Check out the fork
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.PHONE_BRANCH }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure git
+        run: |
+          git config user.name SyscallBrain
+          git config user.email 61458775+SyscallBrain@users.noreply.github.com
+          git remote add upstream "$UPSTREAM"
+          # Tags do upstream: o "zeroclaw --version" mostra o git describe (v0.9.0-N-g<sha>).
+          git fetch --quiet --tags upstream master
+
+      - name: Sync with upstream and apply the patches
+        if: inputs.modo == 'sincronizar'
+        run: |
+          set -euo pipefail
+          # Guardar onde cada branch estava no fork, para o push "--force-with-lease".
+          : > "$RUNNER_TEMP/old-shas"
+          for b in master $PATCHES $PHONE_BRANCH; do
+            echo "$b $(git rev-parse "origin/$b")" >> "$RUNNER_TEMP/old-shas"
+          done
+
+          base=$(git rev-parse upstream/master)
+          echo "upstream master: $base ($(git log -1 --format=%s "$base"))"
+          echo "commits novos no upstream desde o último sync: $(git rev-list --count origin/master..upstream/master)"
+
+          for p in $PATCHES; do
+            git checkout --quiet -B "$p" "origin/$p"
+            echo "::group::rebase $p ($(git rev-list --count "$base".."$p" 2>/dev/null || true) commits)"
+            if ! git rebase "$base"; then
+              echo "::endgroup::"
+              echo "::error title=Conflito no patch $p::O rebase de $p sobre o upstream deu conflito. Ficheiros:"
+              git diff --name-only --diff-filter=U | sed 's/^/    /'
+              git rebase --abort
+              echo "Nada foi publicado. Resolve o conflito à mão (ver a nota) e volta a correr."
+              exit 1
+            fi
+            echo "::endgroup::"
+            git log --oneline "$base..$p"
+          done
+
+          git checkout --quiet -B "$PHONE_BRANCH" "$base"
+          for p in $PATCHES; do
+            if ! git merge --no-ff --no-edit "$p"; then
+              echo "::error title=Conflito ao juntar $p::Os patches chocam uns com os outros em:"
+              git diff --name-only --diff-filter=U | sed 's/^/    /'
+              exit 1
+            fi
+          done
+          git log --oneline --graph -n 12
+
+      - name: Install Rust and the Android NDK
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --target "$TARGET"
+          rustup default "$RUST_VERSION"
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" > /dev/null
+          # O .cargo/config.toml do zeroclaw usa o linker aarch64-linux-android21-clang:
+          # basta pôr a pasta do NDK no PATH.
+          echo "$ANDROID_HOME/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+
+      # Cache de ~/.cargo e target/: o primeiro build demora (~40-60 min), os
+      # seguintes só recompilam o que mudou.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ env.TARGET }}
+
+      - name: Build the daemon
+        run: |
+          features=$(printf "%s" "$FEATURES" | tr -s " " ",")
+          cargo build --release --locked --target "$TARGET" \
+            --no-default-features --features "$features" --bin zeroclaw
+
+      - name: Label the binary
+        run: |
+          bin="target/$TARGET/release/zeroclaw"
+          file "$bin"
+          describe=$(git describe --tags --always)
+          echo "DESCRIBE=$describe" >> "$GITHUB_ENV"
+          mkdir out
+          cp "$bin" out/zeroclaw
+          {
+            echo "git describe:    $describe"
+            echo "phone branch:    $PHONE_BRANCH @ $(git rev-parse HEAD)"
+            echo "upstream master: $(git rev-parse upstream/master)"
+            for p in $PATCHES; do echo "patch:           $p @ $(git rev-parse "$p" 2>/dev/null || git rev-parse "origin/$p")"; done
+            echo "modo:            ${{ inputs.modo }}"
+            echo "run:             $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          } > out/BUILD-INFO.txt
+          (cd out && sha256sum zeroclaw > SHA256SUMS && cat SHA256SUMS BUILD-INFO.txt)
+
+      - name: Upload the binary
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: zeroclaw-${{ env.DESCRIBE }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 7
+
+      # Só chega aqui se o build passou. O token automático do GitHub não pode
+      # fazer push de commits que mexem em .github/workflows (e o upstream mexe
+      # muitas vezes), por isso usa-se um token pessoal só para este fork.
+      - name: Publish the branches to the fork
+        if: inputs.modo == 'sincronizar' && inputs.publicar
+        env:
+          PUSH_TOKEN: ${{ secrets.ZEROCLAW_PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+          url="https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          args=()
+          while read -r b old; do
+            # --force-with-lease: só reescreve o branch se ainda estiver onde
+            # estava no início do run (não apaga trabalho feito entretanto).
+            args+=("--force-with-lease=refs/heads/$b:$old")
+          done < "$RUNNER_TEMP/old-shas"
+          refs=("upstream/master:refs/heads/master")
+          for b in $PATCHES $PHONE_BRANCH; do refs+=("refs/heads/$b:refs/heads/$b"); done
+          git push --atomic "${args[@]}" "$url" "${refs[@]}"
