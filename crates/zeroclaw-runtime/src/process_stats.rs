@@ -45,6 +45,9 @@ struct State {
     /// Last CPU% we returned; served on rapid re-samples so callers still
     /// see a plausible value instead of a sysinfo-internal artifact.
     last_cpu_percent: Option<f32>,
+    /// Previous `/proc/self/stat` CPU ticks and when they were read, for the
+    /// fallback used when sysinfo cannot see the system's CPUs.
+    self_cpu: Option<(Instant, u64)>,
     pid: Pid,
 }
 
@@ -79,6 +82,7 @@ pub fn sample() -> ProcessStats {
             have_baseline: false,
             last_cpu_refresh: None,
             last_cpu_percent: None,
+            self_cpu: None,
             pid,
         }
     });
@@ -113,6 +117,27 @@ pub fn sample() -> ProcessStats {
             .refresh_cpu_specifics(sysinfo::CpuRefreshKind::nothing());
     }
 
+    // sysinfo derives a process's CPU% from the system-wide times in
+    // `/proc/stat`. Android (8+) denies that file to apps, Termux included, so
+    // sysinfo finds no CPUs and leaves `cpu_usage()` at 0 forever. Measure
+    // our own ticks from `/proc/self/stat` against wall time instead.
+    let no_cpus = st.system.cpus().is_empty();
+    let fallback = if no_cpus && cpu_stale {
+        let ticks = self_cpu_ticks();
+        let prev = st.self_cpu;
+        st.self_cpu = ticks.map(|t| (now, t));
+        Some(match (prev, ticks) {
+            (Some((then, before)), Some(after)) => cpu_percent_from_ticks(
+                after.saturating_sub(before),
+                now.duration_since(then),
+                clock_ticks_per_sec(),
+            ),
+            _ => None,
+        })
+    } else {
+        None
+    };
+
     let Some(proc) = st.system.process(st.pid) else {
         return ProcessStats::unsupported();
     };
@@ -120,9 +145,12 @@ pub fn sample() -> ProcessStats {
     let cpu_percent = if cpu_stale {
         st.last_cpu_refresh = Some(now);
         if st.have_baseline {
-            let v = proc.cpu_usage();
-            st.last_cpu_percent = Some(v);
-            Some(v)
+            let v = match fallback {
+                Some(v) => v,
+                None => Some(proc.cpu_usage()),
+            };
+            st.last_cpu_percent = v;
+            v
         } else {
             st.have_baseline = true;
             None
@@ -133,7 +161,11 @@ pub fn sample() -> ProcessStats {
         st.last_cpu_percent
     };
     let system_ram_total_bytes = st.system.total_memory();
-    let num_cpus = st.system.cpus().len() as u32;
+    let num_cpus = match st.system.cpus().len() {
+        // Same Android restriction: count the CPUs we may run on instead.
+        0 => std::thread::available_parallelism().map_or(0, |n| n.get() as u32),
+        n => n as u32,
+    };
 
     ProcessStats {
         rss_bytes,
@@ -143,9 +175,93 @@ pub fn sample() -> ProcessStats {
     }
 }
 
+/// `utime + stime` of this process, in clock ticks, from `/proc/self/stat`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn self_cpu_ticks() -> Option<u64> {
+    parse_stat_ticks(&std::fs::read_to_string("/proc/self/stat").ok()?)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn self_cpu_ticks() -> Option<u64> {
+    None
+}
+
+/// Fields 14 and 15 of a `/proc/<pid>/stat` line. The command name (field 2)
+/// may hold spaces and parentheses, so count from the last `)`.
+fn parse_stat_ticks(stat: &str) -> Option<u64> {
+    let mut rest = stat.get(stat.rfind(')')? + 1..)?.split_whitespace();
+    // After the `)`: field 3 (state) is index 0, so utime (14) is index 11.
+    let utime: u64 = rest.nth(11)?.parse().ok()?;
+    let stime: u64 = rest.next()?.parse().ok()?;
+    Some(utime + stime)
+}
+
+#[cfg(unix)]
+fn clock_ticks_per_sec() -> u64 {
+    // SAFETY: sysconf has no preconditions; it returns -1 on error.
+    let v = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if v > 0 { v as u64 } else { 100 }
+}
+
+#[cfg(not(unix))]
+fn clock_ticks_per_sec() -> u64 {
+    100
+}
+
+/// CPU% summed across cores (0..100*ncpu), like `Process::cpu_usage()`.
+fn cpu_percent_from_ticks(
+    ticks: u64,
+    wall: std::time::Duration,
+    ticks_per_sec: u64,
+) -> Option<f32> {
+    let secs = wall.as_secs_f64();
+    if secs <= 0.0 || ticks_per_sec == 0 {
+        return None;
+    }
+    Some((ticks as f64 / ticks_per_sec as f64 / secs * 100.0) as f32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_stat_ticks_sums_utime_and_stime() {
+        let line =
+            "4321 (zeroclaw) S 1 4321 4321 0 -1 4194560 100 0 0 0 4936 4229 0 0 20 0 30 0 123 0 0";
+        assert_eq!(parse_stat_ticks(line), Some(4936 + 4229));
+    }
+
+    #[test]
+    fn parse_stat_ticks_survives_spaces_and_parens_in_comm() {
+        let line = "7 (tokio (rt) worker) R 1 7 7 0 -1 0 0 0 0 0 10 5 0 0 20 0 1 0 1 0 0";
+        assert_eq!(parse_stat_ticks(line), Some(15));
+    }
+
+    #[test]
+    fn parse_stat_ticks_rejects_garbage() {
+        assert_eq!(parse_stat_ticks(""), None);
+        assert_eq!(parse_stat_ticks("1 (x) S 1 2"), None);
+    }
+
+    #[test]
+    fn cpu_percent_from_ticks_matches_summed_core_contract() {
+        let d = std::time::Duration::from_secs(2);
+        // 100 Hz: 50 ticks over 2 s = 0.5 s of CPU = 25 %.
+        assert_eq!(cpu_percent_from_ticks(50, d, 100), Some(25.0));
+        // Two busy cores for 2 s = 400 ticks = 200 %.
+        assert_eq!(cpu_percent_from_ticks(400, d, 100), Some(200.0));
+        assert_eq!(
+            cpu_percent_from_ticks(1, std::time::Duration::ZERO, 100),
+            None
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn self_cpu_ticks_reads_this_process() {
+        assert!(self_cpu_ticks().is_some());
+    }
 
     #[test]
     fn sample_returns_rss_on_supported_hosts() {
