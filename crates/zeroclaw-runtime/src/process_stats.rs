@@ -3,7 +3,7 @@
 use parking_lot::Mutex;
 use serde::Serialize;
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use sysinfo::{MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
 #[derive(Debug, Clone, Serialize)]
@@ -15,8 +15,10 @@ pub struct ProcessStats {
     /// renders `rss / system_ram_total` as a percentage so the RAM tile is
     /// meaningful at a glance regardless of host size.
     pub system_ram_total_bytes: u64,
-    /// CPU usage as a percentage summed across logical cores (0..100*ncpu).
-    /// `None` on the first sample (no baseline) or unsupported platforms.
+    /// CPU usage as a percentage summed across logical cores (0..100*ncpu),
+    /// averaged over the last completed window of at least `CPU_WINDOW`;
+    /// every caller inside one window gets the same figure. `None` until the
+    /// first window closes, or on unsupported platforms.
     pub cpu_percent: Option<f32>,
     /// Number of logical CPUs the OS reports. Useful for clamping the CPU%
     /// bar on the dashboard. `0` when unknown.
@@ -42,14 +44,26 @@ struct State {
     /// already handles this).
     have_baseline: bool,
     last_cpu_refresh: Option<Instant>,
-    /// Last CPU% we returned; served on rapid re-samples so callers still
-    /// see a plausible value instead of a sysinfo-internal artifact.
+    /// Last CPU% we returned; served to every caller until the current
+    /// window closes, so clients polling on different clocks agree.
     last_cpu_percent: Option<f32>,
     /// Previous `/proc/self/stat` CPU ticks and when they were read, for the
     /// fallback used when sysinfo cannot see the system's CPUs.
     self_cpu: Option<(Instant, u64)>,
     pid: Pid,
 }
+
+/// Shortest span a CPU% reading covers. Every caller inside one window gets
+/// the same reading, so clients polling on their own clocks (the TUI every
+/// 5 s, a phone app every 15 s) see one figure instead of cutting each
+/// other's windows down to a fraction of a second, where a single short
+/// burst reads as a large CPU%. Tests use a shorter window to stay fast.
+const CPU_WINDOW: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_secs(5)
+};
+const _: () = assert!(CPU_WINDOW.as_millis() >= sysinfo::MINIMUM_CPU_UPDATE_INTERVAL.as_millis());
 
 static STATE: OnceLock<Mutex<Option<State>>> = OnceLock::new();
 
@@ -87,14 +101,15 @@ pub fn sample() -> ProcessStats {
         }
     });
 
-    // Skip the CPU-refresh half when the caller is hammering us faster than
-    // sysinfo's internal tick window; otherwise `cpu_usage()` returns a
-    // meaningless floor/ceiling value. Memory refresh is always cheap and
+    // Take a new CPU reading only once the current window is `CPU_WINDOW`
+    // old; until then every caller gets the last one. This also keeps us
+    // above sysinfo's own minimum interval, below which `cpu_usage()` returns
+    // a meaningless floor/ceiling value. Memory refresh is always cheap and
     // has no minimum-interval constraint, so we always update RSS.
     let now = Instant::now();
     let cpu_stale = st
         .last_cpu_refresh
-        .is_none_or(|prev| now.duration_since(prev) >= sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+        .is_none_or(|prev| now.duration_since(prev) >= CPU_WINDOW);
     let refresh_kind = if cpu_stale {
         ProcessRefreshKind::nothing().with_cpu().with_memory()
     } else {
@@ -296,11 +311,9 @@ mod tests {
             return;
         }
         let _ = sample();
-        // sysinfo requires at least MINIMUM_CPU_UPDATE_INTERVAL between
-        // refreshes for the CPU% delta to be meaningful. Sleep just past it.
-        std::thread::sleep(
-            sysinfo::MINIMUM_CPU_UPDATE_INTERVAL + std::time::Duration::from_millis(10),
-        );
+        // A new reading is taken only once a window has passed. Sleep just
+        // past it.
+        std::thread::sleep(CPU_WINDOW + std::time::Duration::from_millis(10));
         for _ in 0..10_000 {
             std::hint::black_box(0u64);
         }
@@ -323,6 +336,51 @@ mod tests {
         );
     }
 
+    /// Regression: each caller used to get the CPU spent since the previous
+    /// caller's sample. Two clients polling on their own clocks cut each
+    /// other's windows down to a fraction of a second, so one short burst
+    /// read as a large CPU% to whichever client landed right after it.
+    /// Samples taken inside one window must all report the same reading.
+    #[test]
+    fn clients_inside_one_window_share_the_reading() {
+        if !sysinfo::IS_SUPPORTED_SYSTEM {
+            return;
+        }
+        let _ = sample();
+
+        // Past sysinfo's own minimum, still well inside the window.
+        let gap = sysinfo::MINIMUM_CPU_UPDATE_INTERVAL + std::time::Duration::from_millis(50);
+        assert!(gap * 2 < CPU_WINDOW);
+
+        const ATTEMPTS: usize = 5;
+        for _ in 0..ATTEMPTS {
+            std::thread::sleep(CPU_WINDOW + std::time::Duration::from_millis(10));
+            let anchor = Instant::now();
+            let first = sample();
+            assert!(first.cpu_percent.is_some(), "a window has closed by now");
+            // Burn CPU between the two: without a shared window the second
+            // caller reads this burst alone (near 100 %) while the first read
+            // the idle sleep above (near 0 %), so idle-equals-idle cannot
+            // hide the bug.
+            let burn = Instant::now();
+            let mut x = 0u64;
+            while burn.elapsed() < gap {
+                x = std::hint::black_box(x.wrapping_add(1));
+            }
+            let second = sample();
+            if anchor.elapsed() >= CPU_WINDOW {
+                // The runner stalled us past the window: no verdict.
+                continue;
+            }
+            assert_eq!(
+                first.cpu_percent, second.cpu_percent,
+                "a second client {gap:?} later must get the same window"
+            );
+            return;
+        }
+        panic!("never got two samples inside one window in {ATTEMPTS} attempts");
+    }
+
     #[test]
     fn rapid_resample_reuses_last_cpu_percent_instead_of_sysinfo_artifact() {
         if !sysinfo::IS_SUPPORTED_SYSTEM {
@@ -330,7 +388,7 @@ mod tests {
         }
 
         // The property under test is conditional: resamples that land inside
-        // MINIMUM_CPU_UPDATE_INTERVAL of the last real reading must reuse it.
+        // CPU_WINDOW of the last real reading must reuse it.
         // The condition is a timing premise this test cannot force on a
         // loaded runner: under a parallel test run the thread can be
         // descheduled between the samples for longer than the interval
@@ -359,26 +417,24 @@ mod tests {
         for attempt in 1..=ATTEMPTS {
             // Ensure the next sample takes (or observes) a reading no older
             // than `anchor`, then prime.
-            std::thread::sleep(
-                sysinfo::MINIMUM_CPU_UPDATE_INTERVAL + std::time::Duration::from_millis(10),
-            );
+            std::thread::sleep(CPU_WINDOW + std::time::Duration::from_millis(10));
             let anchor = Instant::now();
             let primed = sample();
             assert!(primed.cpu_percent.is_some(), "primed sample has cpu%");
 
             // Back-to-back calls intended to land well under
-            // MINIMUM_CPU_UPDATE_INTERVAL — without rate limiting sysinfo
+            // CPU_WINDOW — without rate limiting sysinfo
             // would return 0 (or 100*ncpu on Linux) instead of the cache.
             let a = sample();
             let b = sample();
             let elapsed = anchor.elapsed();
 
-            if elapsed >= sysinfo::MINIMUM_CPU_UPDATE_INTERVAL {
+            if elapsed >= CPU_WINDOW {
                 // Premise blown: the runner stalled us across the interval,
                 // so a fresh reading was legitimate. Not a verdict either way.
                 last_failure = format!(
                     "attempt {attempt}: sequence took {elapsed:?}, \
-                     exceeding MINIMUM_CPU_UPDATE_INTERVAL"
+                     exceeding CPU_WINDOW"
                 );
                 continue;
             }
