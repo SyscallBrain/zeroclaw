@@ -74,7 +74,17 @@ jobs:
         if: inputs.checks
         run: cargo test --locked -p zerocode
 
+      # Some of inkjet's tree-sitter grammars have C++ scanners, and on Android
+      # the cc crate links C++ against libc++_shared.so by default. Termux's
+      # loader does not look in $PREFIX/lib, so that binary would not start
+      # ("library libc++_shared.so not found"). Link libc++ statically instead;
+      # libc++abi supplies the C++ runtime (__cxa_*) that libc++_static lacks.
+      # This variable replaces target.aarch64-linux-android.rustflags from
+      # .cargo/config.toml, so the stack-size flag is repeated here.
       - name: Build zerocode
+        env:
+          CXXSTDLIB_aarch64_linux_android: c++_static
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS: -C link-arg=-Wl,-z,stack-size=8388608 -C link-arg=-lc++abi
         run: cargo build --release --locked --target "$TARGET" -p zerocode --bin zerocode
 
       - name: Label the binary
@@ -83,6 +93,13 @@ jobs:
         run: |
           bin="target/$TARGET/release/zerocode"
           file "$bin"
+          # Fail here rather than on the phone if a shared C++ runtime sneaks
+          # back in (see the Build step).
+          readelf -d "$bin" | grep NEEDED
+          if readelf -d "$bin" | grep -q 'libc++_shared'; then
+            echo "::error::zerocode needs libc++_shared.so, which Termux cannot load"
+            exit 1
+          fi
           describe=$(git describe --tags --always)
           echo "DESCRIBE=$describe" >> "$GITHUB_ENV"
           mkdir out
